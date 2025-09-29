@@ -2,7 +2,7 @@
   <img src="logo.png" alt="WattDownload Logo" width="200px">
 </p>
 
-<h1 align="center">WP | EPUB | Extra-Mini | Telegram Bot</h1>
+<h1 align="center">WP | EPUB | Extra-Mini | Telegram Bot | Shuttle</h1>
 
 <p align="center">
   Extra-Minimal Telegram Bot to Download Stories from WP in EPUB (version 3) format. <br/>
