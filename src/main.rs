@@ -251,7 +251,8 @@ async fn receive_story_id(
             let title = info
                 .title
                 .unwrap_or_else(|| "No title available".to_string());
-            let description = info
+
+            let mut description = info
                 .description
                 .unwrap_or_else(|| "No description available.".to_string());
 
