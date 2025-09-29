@@ -231,13 +231,16 @@ async fn receive_story_id(
         StoryField::Mature,
     ];
 
-    match client
+        match client
         .story
         .get_story_info(story_id_num, Some(fields))
         .await
     {
         Ok(info) => {
             bot.delete_message(msg.chat.id, status_msg.id).await.ok();
+
+            // Telegram API Limits
+            const MAX_CAPTION_LENGTH: usize = 1024;
 
             let mature_text = if info.mature.unwrap_or(false) {
                 "Yes"
@@ -252,31 +255,57 @@ async fn receive_story_id(
                 .description
                 .unwrap_or_else(|| "No description available.".to_string());
 
-            let caption = format!(
-                "**{}**\n\n{}\n\n**Mature:** {}",
-                escape(&title),
-                escape(&description),
-                mature_text
-            );
+            // Calculate the length of the caption's "frame" (everything *except* the description).
+            let title_part = format!("**{}**", escape(&title));
+            let mature_part = format!("**Mature:** {}", mature_text);
+            // The two `\n\n` separators add 4 characters.
+            let frame_len = title_part.len() + mature_part.len() + 4;
 
-            if let Some(cover_url_string) = info.cover {
-                // We have a cover URL, try to parse and send it as a photo
-                if let Ok(cover_url) = cover_url_string.parse() {
-                    bot.send_photo(msg.chat.id, teloxide::types::InputFile::url(cover_url))
-                        .caption(caption)
-                        .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                        .reply_markup(make_confirm_keyboard())
-                        .await?;
-                } else {
-                    // The URL was invalid, so we send a text message instead
-                    bot.send_message(msg.chat.id, caption)
-                        .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                        .reply_markup(make_confirm_keyboard())
-                        .await?;
+            // Calculate the space left for the description.
+            if frame_len < MAX_CAPTION_LENGTH {
+                let available_space = MAX_CAPTION_LENGTH - frame_len;
+                let ellipsis = "...";
+
+                // Trim the description if it exceeds the available space.
+                if description.chars().count() > available_space {
+                    if available_space > ellipsis.len() {
+                        // Shorten description to fit, leaving room for "..."
+                        let trim_to = available_space - ellipsis.len();
+                        description = description.chars().take(trim_to).collect();
+                        description.push_str(ellipsis);
+                    } else {
+                        // Not even enough space for an ellipsis, so just clear the description.
+                        description.clear();
+                    }
                 }
             } else {
-                // No cover was provided, so send a text message
-                bot.send_message(msg.chat.id, caption)
+                // If the title and mature text alone are too long, we can't include a description.
+                description.clear();
+            }
+
+            let full_caption = format!(
+                "{}\n\n{}\n\n{}",
+                title_part,
+                escape(&description),
+                mature_part
+            );
+
+            // Determine if we can send the cover photo
+            let maybe_photo = if let Some(cover_url_string) = info.cover {
+                cover_url_string.parse().ok().map(teloxide::types::InputFile::url)
+            } else {
+                None
+            };
+
+            if let Some(photo) = maybe_photo {
+                bot.send_photo(msg.chat.id, photo)
+                    .caption(full_caption)
+                    .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                    .reply_markup(make_confirm_keyboard())
+                    .await?;
+            } else {
+                // No cover, send as a single text message
+                bot.send_message(msg.chat.id, full_caption)
                     .parse_mode(teloxide::types::ParseMode::MarkdownV2)
                     .reply_markup(make_confirm_keyboard())
                     .await?;
