@@ -17,7 +17,14 @@ use std::sync::Arc;
 use wp_mini_epub::{download_story_to_memory, login, AppError};
 
 use log::{error, info};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use std::time::Duration;
+
+static STORY_URL_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^https?://(?:www\.)?wattpad\.com/story/(\d+).*").unwrap());
+static PART_URL_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^https?://(?:www\.)?wattpad\.com/(\d+).*").unwrap());
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "Available commands:")]
@@ -38,26 +45,26 @@ pub enum State {
     Start,
     ReceiveStoryId,
     ReceiveStoryConfirmation {
-        story_id: String,
+        story_id: u64,
         title: String,
     },
     ReceiveImageOption {
-        story_id: String,
+        story_id: u64,
         title: String,
     },
     ReceiveLoginDecision {
-        story_id: String,
+        story_id: u64,
         title: String,
         embed_images: bool,
     },
     ReceiveUsername {
-        story_id: String,
+        story_id: u64,
         title: String,
         embed_images: bool,
         prompt_message_id: MessageId,
     },
     ReceivePassword {
-        story_id: String,
+        story_id: u64,
         title: String,
         embed_images: bool,
         username: String,
@@ -149,6 +156,68 @@ fn create_logged_in_http_client() -> Client {
         .expect("Failed to create temporary reqwest client")
 }
 
+async fn parse_story_id_from_input(input: &str, client: &WattpadClient) -> Result<u64, String> {
+    // Try to match a full story URL
+    if let Some(captures) = STORY_URL_REGEX.captures(input) {
+        if let Some(id_match) = captures.get(1) {
+            let story_id_str = id_match.as_str();
+            info!("Matched story URL, found ID: {}", story_id_str);
+            return story_id_str
+                .parse::<u64>()
+                .map_err(|_| "Invalid story ID found in URL.".to_string());
+        }
+    }
+
+    // If not a story URL, try to match a chapter/part URL
+    if let Some(captures) = PART_URL_REGEX.captures(input) {
+        if let Some(id_match) = captures.get(1) {
+            let part_id_str = id_match.as_str();
+            info!("Matched part URL, found part ID: {}", part_id_str);
+            let part_id = part_id_str
+                .parse::<u64>()
+                .map_err(|_| "Invalid chapter ID found in URL.".to_string())?;
+
+            // Make an API call to get the main story ID
+            info!("Fetching story ID for part ID: {}", part_id);
+            return match client
+                .story
+                .get_part_info(part_id, Some(&[wp_mini::field::PartField::GroupId]))
+                .await
+            {
+                Ok(part_info) => {
+                    // Check if the API returned a valid ID string.
+                    if let Some(id_string) = part_info.group_id { // `id_string` is now a String
+                        info!("Successfully found story ID string: {}", id_string);
+
+                        // This can fail if the string is not a valid number.
+                        match id_string.parse::<u64>() {
+                            Ok(id_num) => Ok(id_num), // If parsing succeeds, return the number.
+                            Err(_) => {
+                                // If parsing fails, return an error.
+                                error!("API returned a non-numeric group_id: {}", id_string);
+                                Err("Story ID returned by API was invalid.".to_string())
+                            }
+                        }
+                    } else {
+                        // The API returned `None`, which is still an error.
+                        error!("API did not return a group_id for part {}", part_id);
+                        Err("Could not find a story for that chapter URL.".to_string())
+                    }
+                }
+                Err(_) => {
+                    Err("Could not find a story associated with that chapter URL.".to_string())
+                }
+            };
+        }
+    }
+
+    // If neither matched, assume it's a plain ID
+    info!("No URL matched, attempting to parse as plain ID: {}", input);
+    input
+        .parse::<u64>()
+        .map_err(|_| "Input is not a valid Wattpad ID or URL. Please try again.".to_string())
+}
+
 #[shuttle_runtime::main]
 async fn main(
     #[shuttle_runtime::Secrets] secret_store: SecretStore,
@@ -189,7 +258,7 @@ async fn command_handler(
         Command::Download => {
             bot.send_message(
                 msg.chat.id,
-                "Let's begin! Please send me the Wattpad Story ID.",
+                "Let's begin! Please send me the Wattpad Story ID / Link",
             )
             .await?;
             dialogue.update(State::ReceiveStoryId).await?;
@@ -218,145 +287,137 @@ async fn receive_story_id(
     msg: Message,
     client: Arc<WattpadClient>,
 ) -> HandlerResult {
-    let story_id_str = match msg.text() {
-        Some(text) => text.to_string(),
+    // 1. Get the user's input text (which could be an ID, story URL, or part URL)
+    let input_text = match msg.text() {
+        Some(text) => text,
         None => {
-            bot.send_message(msg.chat.id, "Please send the Story ID as plain text.")
+            bot.send_message(msg.chat.id, "Please send a Story ID / Link")
                 .await?;
             return Ok(());
         }
     };
 
-    let story_id_num: u64 = match story_id_str.parse() {
-        Ok(id) => id,
-        Err(_) => {
-            bot.send_message(
-                msg.chat.id,
-                "That doesn't look like a valid Story ID. Please send numbers only.",
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
+    // 2. Send an initial "processing" message that we can edit later
     let status_msg = bot
-        .send_message(msg.chat.id, "🔍 Fetching story details...")
+        .send_message(msg.chat.id, "🔍 Processing your request...")
         .await?;
 
-    let fields = &[
-        StoryField::Title,
-        StoryField::Cover,
-        StoryField::Description,
-        StoryField::Mature,
-    ];
+    // 3. Call our universal parser to get the story ID
+    match parse_story_id_from_input(input_text, &client).await {
+        // --- Success Case: A valid Story ID was found ---
+        Ok(story_id_num) => {
+            bot.edit_message_text(
+                msg.chat.id,
+                status_msg.id,
+                "✅ ID found! Fetching story details...",
+            )
+            .await?;
 
-    match client
-        .story
-        .get_story_info(story_id_num, Some(fields))
-        .await
-    {
-        Ok(info) => {
-            bot.delete_message(msg.chat.id, status_msg.id).await.ok();
+            let fields = &[
+                StoryField::Title,
+                StoryField::Cover,
+                StoryField::Description,
+                StoryField::Mature,
+            ];
 
-            // Telegram API Limits
-            const MAX_CAPTION_LENGTH: usize = 1024;
+            match client
+                .story
+                .get_story_info(story_id_num, Some(fields))
+                .await
+            {
+                Ok(info) => {
+                    bot.delete_message(msg.chat.id, status_msg.id).await.ok();
 
-            let mature_text = if info.mature.unwrap_or(false) {
-                "Yes"
-            } else {
-                "No"
-            };
+                    let mature = info.mature.unwrap_or(false);
+                    let title = info
+                        .title
+                        .unwrap_or_else(|| "No title available".to_string());
 
-            let title = info
-                .title
-                .unwrap_or_else(|| "No title available".to_string());
+                    let mature_text = if mature { "Yes" } else { "No" };
+                    let mut description = info
+                        .description
+                        .unwrap_or_else(|| "No description available.".to_string());
 
-            let mut description = info
-                .description
-                .unwrap_or_else(|| "No description available.".to_string());
+                    const MAX_CAPTION_LENGTH: usize = 1024;
+                    let title_part = format!("**{}**", escape(&title));
+                    let mature_part = format!("**Mature:** {}", mature_text);
+                    let frame_len = title_part.len() + mature_part.len() + 4;
 
-            // Calculate the length of the caption's "frame" (everything *except* the description).
-            let title_part = format!("**{}**", escape(&title));
-            let mature_part = format!("**Mature:** {}", mature_text);
-            // The two `\n\n` separators add 4 characters.
-            let frame_len = title_part.len() + mature_part.len() + 4;
+                    if frame_len < MAX_CAPTION_LENGTH {
+                        let available_space = MAX_CAPTION_LENGTH - frame_len;
+                        let ellipsis = "...";
 
-            // Calculate the space left for the description.
-            if frame_len < MAX_CAPTION_LENGTH {
-                let available_space = MAX_CAPTION_LENGTH - frame_len;
-                let ellipsis = "...";
-
-                // Trim the description if it exceeds the available space.
-                if description.chars().count() > available_space {
-                    if available_space > ellipsis.len() {
-                        // Shorten description to fit, leaving room for "..."
-                        let trim_to = available_space - ellipsis.len();
-                        description = description.chars().take(trim_to).collect();
-                        description.push_str(ellipsis);
+                        if description.chars().count() > available_space {
+                            if available_space > ellipsis.len() {
+                                let trim_to = available_space - ellipsis.len();
+                                description = description.chars().take(trim_to).collect();
+                                description.push_str(ellipsis);
+                            } else {
+                                description.clear();
+                            }
+                        }
                     } else {
-                        // Not even enough space for an ellipsis, so just clear the description.
                         description.clear();
                     }
+
+                    let full_caption = format!(
+                        "{}\n\n{}\n\n{}",
+                        title_part,
+                        escape(&description),
+                        mature_part
+                    );
+
+                    let maybe_photo = if let Some(cover_url_string) = info.cover {
+                        cover_url_string
+                            .parse()
+                            .ok()
+                            .map(teloxide::types::InputFile::url)
+                    } else {
+                        None
+                    };
+
+                    if let Some(photo) = maybe_photo {
+                        bot.send_photo(msg.chat.id, photo)
+                            .caption(full_caption)
+                            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                            .reply_markup(make_confirm_keyboard())
+                            .await?;
+                    } else {
+                        bot.send_message(msg.chat.id, full_caption)
+                            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                            .reply_markup(make_confirm_keyboard())
+                            .await?;
+                    }
+
+                    dialogue
+                        .update(State::ReceiveStoryConfirmation {
+                            story_id: story_id_num,
+                            title,
+                        })
+                        .await?;
                 }
-            } else {
-                // If the title and mature text alone are too long, we can't include a description. It fails anyway here.
-                description.clear();
+                Err(WattpadError::RequestError(_)) => {
+                    bot.edit_message_text(
+                        msg.chat.id,
+                        status_msg.id,
+                        "❌ Sorry, a story with that ID could not be found. Please try another one.",
+                    )
+                        .await?;
+                }
+                Err(e) => {
+                    error!("Wattpad API Error: {:?}", e);
+                    bot.edit_message_text(
+                        msg.chat.id,
+                        status_msg.id,
+                        "⚠️ An unexpected error occurred while fetching story details. Please try again.",
+                    )
+                        .await?;
+                }
             }
-
-            let full_caption = format!(
-                "{}\n\n{}\n\n{}",
-                title_part,
-                escape(&description),
-                mature_part
-            );
-
-            // Determine if we can send the cover photo
-            let maybe_photo = if let Some(cover_url_string) = info.cover {
-                cover_url_string
-                    .parse()
-                    .ok()
-                    .map(teloxide::types::InputFile::url)
-            } else {
-                None
-            };
-
-            if let Some(photo) = maybe_photo {
-                bot.send_photo(msg.chat.id, photo)
-                    .caption(full_caption)
-                    .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                    .reply_markup(make_confirm_keyboard())
-                    .await?;
-            } else {
-                // No cover, send as a single text message
-                bot.send_message(msg.chat.id, full_caption)
-                    .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                    .reply_markup(make_confirm_keyboard())
-                    .await?;
-            }
-
-            dialogue
-                .update(State::ReceiveStoryConfirmation {
-                    story_id: story_id_str,
-                    title,
-                })
+        }
+        Err(error_message) => {
+            bot.edit_message_text(msg.chat.id, status_msg.id, format!("❌ {}", error_message))
                 .await?;
-        }
-        Err(WattpadError::RequestError(_)) => {
-            bot.edit_message_text(
-                msg.chat.id,
-                status_msg.id,
-                "❌ Sorry, a story with that ID could not be found. Please try another one.",
-            )
-            .await?;
-        }
-        Err(e) => {
-            error!("Wattpad API Error: {:?}", e);
-            bot.edit_message_text(
-                msg.chat.id,
-                status_msg.id,
-                "⚠️ An unexpected error occurred while fetching story details. Please try again.",
-            )
-            .await?;
         }
     }
 
@@ -383,7 +444,10 @@ async fn callback_query_handler(
             if data == "confirm" {
                 if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(msg)) = q.message {
                     bot.edit_message_caption(msg.chat.id, msg.id)
-                        .caption(format!("✅ Confirmed! Let's proceed for story: \n  -> {}", &title))
+                        .caption(format!(
+                            "✅ Confirmed! Let's proceed for story: \n  -> {}",
+                            &title
+                        ))
                         .await?;
                 }
 
@@ -402,7 +466,7 @@ async fn callback_query_handler(
                 }
                 bot.send_message(
                     dialogue.chat_id(),
-                    "Okay, let's start over. Please send me a Wattpad Story ID.",
+                    "Okay, let's start over. Please send me a Wattpad Story ID / URL",
                 )
                 .await?;
                 dialogue.update(State::ReceiveStoryId).await?;
@@ -475,7 +539,7 @@ async fn callback_query_handler(
                     &bot,
                     dialogue.chat_id(),
                     &dialogue,
-                    &story_id,
+                    story_id,
                     &title,
                     embed_images,
                     Some(status_msg.id),
@@ -501,7 +565,7 @@ async fn receive_username(
     bot: Bot,
     dialogue: MyDialogue,
     msg: Message,
-    (story_id, title, embed_images, prompt_message_id): (String, String, bool, MessageId),
+    (story_id, title, embed_images, prompt_message_id): (u64, String, bool, MessageId),
 ) -> HandlerResult {
     bot.delete_message(msg.chat.id, prompt_message_id)
         .await
@@ -538,7 +602,7 @@ async fn receive_password(
     dialogue: MyDialogue,
     msg: Message,
     (story_id, title, embed_images, username, prompt_message_id): (
-        String,
+        u64,
         String,
         bool,
         String,
@@ -586,7 +650,7 @@ async fn receive_password(
                 &bot,
                 msg.chat.id,
                 &dialogue,
-                &story_id,
+                story_id,
                 &title,
                 embed_images,
                 Some(generating_msg.id),
@@ -642,20 +706,19 @@ async fn trigger_epub_generation(
     bot: &Bot,
     chat_id: ChatId,
     dialogue: &MyDialogue,
-    story_id: &str,
+    story_id: u64,
     title: &str,
     embed_images: bool,
     status_message_id: Option<MessageId>,
     http_client: &Client,
 ) -> HandlerResult {
     const CONCURRENT_CHAPTER_REQUESTS: usize = 10;
-    let story_id_num: u64 = story_id.parse()?;
 
     info!("Generating EPUB for story_id: {}", story_id);
 
     let epub_result = download_story_to_memory(
         &http_client,
-        story_id_num,
+        story_id,
         embed_images,
         CONCURRENT_CHAPTER_REQUESTS,
     )
