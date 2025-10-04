@@ -95,7 +95,7 @@ impl Service for WattpadBot {
                     prompt_message_id
                 }]
                 .endpoint(receive_password),
-            );
+            .branch(dptree::endpoint(unhandled_message_handler));
 
         let callback_handler = Update::filter_callback_query()
             .enter_dialogue::<CallbackQuery, InMemStorage<State>, State>()
@@ -190,6 +190,15 @@ async fn command_handler(
             dialogue.exit().await?;
         }
     }
+    Ok(())
+}
+
+async fn unhandled_message_handler(bot: Bot, msg: Message) -> HandlerResult {
+    bot.send_message(
+        msg.chat.id,
+        "Sorry, I didn't understand that. Please use /download to start.",
+    )
+    .await?;
     Ok(())
 }
 
