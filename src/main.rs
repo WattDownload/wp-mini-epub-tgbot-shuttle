@@ -1,4 +1,5 @@
-use shuttle_runtime::{ SecretStore, Service };
+use shuttle_runtime::{SecretStore, Service};
+use std::error::Error;
 
 use anyhow::Result;
 use teloxide::utils::markdown::escape;
@@ -11,10 +12,11 @@ use teloxide::{
 use wp_mini::field::StoryField;
 use wp_mini::{WattpadClient, WattpadError};
 
-use reqwest::Client;
+use reqwest::{Client, ClientBuilder};
 use std::sync::Arc;
 use wp_mini_epub::{download_story_to_memory, login, AppError};
 
+use log::{error, info};
 use std::time::Duration;
 
 #[derive(BotCommands, Clone)]
@@ -37,21 +39,26 @@ pub enum State {
     ReceiveStoryId,
     ReceiveStoryConfirmation {
         story_id: String,
+        title: String,
     },
     ReceiveImageOption {
         story_id: String,
+        title: String,
     },
     ReceiveLoginDecision {
         story_id: String,
+        title: String,
         embed_images: bool,
     },
     ReceiveUsername {
         story_id: String,
+        title: String,
         embed_images: bool,
         prompt_message_id: MessageId,
     },
     ReceivePassword {
         story_id: String,
+        title: String,
         embed_images: bool,
         username: String,
         prompt_message_id: MessageId,
@@ -59,7 +66,7 @@ pub enum State {
 }
 
 type MyDialogue = Dialogue<State, InMemStorage<State>>;
-type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+type HandlerResult = Result<(), Box<dyn Error + Send + Sync>>;
 
 struct WattpadBot {
     bot: Bot,
@@ -70,7 +77,6 @@ struct WattpadBot {
 #[shuttle_runtime::async_trait]
 impl Service for WattpadBot {
     async fn bind(mut self, _addr: std::net::SocketAddr) -> Result<(), shuttle_runtime::Error> {
-
         let handler = Update::filter_message()
             .enter_dialogue::<Message, InMemStorage<State>, State>()
             .branch(
@@ -82,6 +88,7 @@ impl Service for WattpadBot {
             .branch(
                 dptree::case![State::ReceiveUsername {
                     story_id,
+                    title,
                     embed_images,
                     prompt_message_id
                 }]
@@ -90,11 +97,13 @@ impl Service for WattpadBot {
             .branch(
                 dptree::case![State::ReceivePassword {
                     story_id,
+                    title,
                     embed_images,
                     username,
                     prompt_message_id
                 }]
                 .endpoint(receive_password),
+            )
             .branch(dptree::endpoint(unhandled_message_handler));
 
         let callback_handler = Update::filter_callback_query()
@@ -119,6 +128,27 @@ impl Service for WattpadBot {
     }
 }
 
+fn http_client_builder() -> ClientBuilder {
+    const APP_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36";
+
+    Client::builder()
+        .user_agent(APP_USER_AGENT)
+        .timeout(Duration::from_secs(300))
+}
+
+fn build_http_client() -> Client {
+    http_client_builder()
+        .build()
+        .expect("Failed to create reqwest client")
+}
+
+fn create_logged_in_http_client() -> Client {
+    http_client_builder()
+        .cookie_store(true)
+        .build()
+        .expect("Failed to create temporary reqwest client")
+}
+
 #[shuttle_runtime::main]
 async fn main(
     #[shuttle_runtime::Secrets] secret_store: SecretStore,
@@ -129,15 +159,7 @@ async fn main(
 
     let bot = Bot::new(token);
 
-    const APP_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36";
-    let http_client = Arc::new(
-        Client::builder()
-            .user_agent(APP_USER_AGENT)
-            .timeout(Duration::from_secs(300))
-            .build()
-            .expect("Failed to create reqwest client"),
-    );
-
+    let http_client = Arc::new(build_http_client());
     let wattpad_client = Arc::new(WattpadClient::new());
 
     Ok(WattpadBot {
@@ -146,18 +168,6 @@ async fn main(
         wattpad_client,
     })
 }
-
-fn create_logged_in_client() -> Client {
-    const APP_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36";
-
-    Client::builder()
-        .user_agent(APP_USER_AGENT)
-        .cookie_store(true)
-        .timeout(Duration::from_secs(300))
-        .build()
-        .expect("Failed to create temporary reqwest client")
-}
-
 async fn command_handler(
     bot: Bot,
     dialogue: MyDialogue,
@@ -168,7 +178,7 @@ async fn command_handler(
         Command::Start => {
             bot.send_message(
                 msg.chat.id,
-                "Welcome to the Wattpad Downloader Bot! 📚\n\nUse /download to begin saving a story as an EPUB.\nUse /cancel to cancel the download.",
+                "Welcome to the WattDownload Bot! 📚\n\nUse /download to begin saving a story as an EPUB.\nUse /cancel to cancel the download.",
             )
                 .await?;
         }
@@ -240,7 +250,7 @@ async fn receive_story_id(
         StoryField::Mature,
     ];
 
-        match client
+    match client
         .story
         .get_story_info(story_id_num, Some(fields))
         .await
@@ -289,7 +299,7 @@ async fn receive_story_id(
                     }
                 }
             } else {
-                // If the title and mature text alone are too long, we can't include a description.
+                // If the title and mature text alone are too long, we can't include a description. It fails anyway here.
                 description.clear();
             }
 
@@ -302,7 +312,10 @@ async fn receive_story_id(
 
             // Determine if we can send the cover photo
             let maybe_photo = if let Some(cover_url_string) = info.cover {
-                cover_url_string.parse().ok().map(teloxide::types::InputFile::url)
+                cover_url_string
+                    .parse()
+                    .ok()
+                    .map(teloxide::types::InputFile::url)
             } else {
                 None
             };
@@ -324,6 +337,7 @@ async fn receive_story_id(
             dialogue
                 .update(State::ReceiveStoryConfirmation {
                     story_id: story_id_str,
+                    title,
                 })
                 .await?;
         }
@@ -336,7 +350,7 @@ async fn receive_story_id(
             .await?;
         }
         Err(e) => {
-            log::error!("Wattpad API Error: {:?}", e);
+            error!("Wattpad API Error: {:?}", e);
             bot.edit_message_text(
                 msg.chat.id,
                 status_msg.id,
@@ -365,11 +379,11 @@ async fn callback_query_handler(
     let state = dialogue.get().await?.unwrap_or_default();
 
     match state {
-        State::ReceiveStoryConfirmation { story_id } => {
+        State::ReceiveStoryConfirmation { story_id, title } => {
             if data == "confirm" {
                 if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(msg)) = q.message {
                     bot.edit_message_caption(msg.chat.id, msg.id)
-                        .caption("✅ Confirmed! Let's proceed.")
+                        .caption(format!("✅ Confirmed! Let's proceed for story: \n  -> {}", &title))
                         .await?;
                 }
 
@@ -378,7 +392,7 @@ async fn callback_query_handler(
                     .reply_markup(keyboard)
                     .await?;
                 dialogue
-                    .update(State::ReceiveImageOption { story_id })
+                    .update(State::ReceiveImageOption { story_id, title })
                     .await?;
             } else {
                 if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(msg)) = q.message {
@@ -394,7 +408,7 @@ async fn callback_query_handler(
                 dialogue.update(State::ReceiveStoryId).await?;
             }
         }
-        State::ReceiveImageOption { story_id } => {
+        State::ReceiveImageOption { story_id, title } => {
             if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(msg)) = q.message {
                 let confirmation_text = if data == "yes" {
                     "✅ We'll embed images for you."
@@ -416,12 +430,14 @@ async fn callback_query_handler(
             dialogue
                 .update(State::ReceiveLoginDecision {
                     story_id,
+                    title,
                     embed_images,
                 })
                 .await?;
         }
         State::ReceiveLoginDecision {
             story_id,
+            title,
             embed_images,
         } => {
             if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(msg)) = q.message {
@@ -442,6 +458,7 @@ async fn callback_query_handler(
                 dialogue
                     .update(State::ReceiveUsername {
                         story_id,
+                        title,
                         embed_images,
                         prompt_message_id: prompt_msg.id,
                     })
@@ -459,8 +476,8 @@ async fn callback_query_handler(
                     dialogue.chat_id(),
                     &dialogue,
                     &story_id,
+                    &title,
                     embed_images,
-                    None,
                     Some(status_msg.id),
                     &http_client,
                 )
@@ -484,7 +501,7 @@ async fn receive_username(
     bot: Bot,
     dialogue: MyDialogue,
     msg: Message,
-    (story_id, embed_images, prompt_message_id): (String, bool, MessageId),
+    (story_id, title, embed_images, prompt_message_id): (String, String, bool, MessageId),
 ) -> HandlerResult {
     bot.delete_message(msg.chat.id, prompt_message_id)
         .await
@@ -501,6 +518,7 @@ async fn receive_username(
             dialogue
                 .update(State::ReceivePassword {
                     story_id,
+                    title,
                     embed_images,
                     username: username.to_string(),
                     prompt_message_id: new_prompt.id,
@@ -519,7 +537,13 @@ async fn receive_password(
     bot: Bot,
     dialogue: MyDialogue,
     msg: Message,
-    (story_id, embed_images, username, prompt_message_id): (String, bool, String, MessageId),
+    (story_id, title, embed_images, username, prompt_message_id): (
+        String,
+        String,
+        bool,
+        String,
+        MessageId,
+    ),
 ) -> HandlerResult {
     bot.delete_message(msg.chat.id, msg.id).await.ok();
     bot.delete_message(msg.chat.id, prompt_message_id)
@@ -540,11 +564,12 @@ async fn receive_password(
         .send_message(msg.chat.id, "🔐 Verifying credentials...")
         .await?;
 
-    let logged_in_client = create_logged_in_client();
+    let logged_in_client = create_logged_in_http_client();
 
     // Attempt to log in FIRST
     match login(&logged_in_client, &username, &password).await {
         Ok(_) => {
+            info!("Logged in successfully. for username {}", username);
             // Login successful, now trigger the download
             let generating_msg = bot
                 .edit_message_text(
@@ -557,15 +582,13 @@ async fn receive_password(
                 )
                 .await?;
 
-            let credentials = Some((username, password));
-
             trigger_epub_generation(
                 &bot,
                 msg.chat.id,
                 &dialogue,
                 &story_id,
+                &title,
                 embed_images,
-                credentials,
                 Some(generating_msg.id),
                 &logged_in_client,
             )
@@ -573,11 +596,11 @@ async fn receive_password(
         }
         Err(e) => {
             // Login failed, notify the user and restart the login process
-            log::error!("Authentication failed: {:?}", e);
+            error!("Authentication failed: {:?} for user {}", e, username);
             bot.edit_message_text(
                 msg.chat.id,
                 status_msg.id,
-                "❌ Authentication failed. Please check your credentials and try again.",
+                format!("❌ Authentication failed for @{}.  Please check your credentials and try again.", username),
             )
             .await?;
 
@@ -588,6 +611,7 @@ async fn receive_password(
             dialogue
                 .update(State::ReceiveUsername {
                     story_id,
+                    title,
                     embed_images,
                     prompt_message_id: prompt_msg.id,
                 })
@@ -619,19 +643,15 @@ async fn trigger_epub_generation(
     chat_id: ChatId,
     dialogue: &MyDialogue,
     story_id: &str,
+    title: &str,
     embed_images: bool,
-    credentials: Option<(String, String)>,
     status_message_id: Option<MessageId>,
     http_client: &Client,
 ) -> HandlerResult {
     const CONCURRENT_CHAPTER_REQUESTS: usize = 10;
     let story_id_num: u64 = story_id.parse()?;
 
-    if credentials.is_some() {
-        log::info!("Handling authenticated EPUB request.");
-    } else {
-        log::info!("Handling anonymous EPUB request.");
-    }
+    info!("Generating EPUB for story_id: {}", story_id);
 
     let epub_result = download_story_to_memory(
         &http_client,
@@ -653,14 +673,16 @@ async fn trigger_epub_generation(
             )
             .await?;
 
-            let filename = format!("story_{}.epub", story_id);
+            let sanitized_title = sanitize_filename(title);
+            let filename = format!("{}-{}.epub", sanitized_title, story_id);
+
             let file_to_send = teloxide::types::InputFile::memory(epub_bytes).file_name(filename);
 
             bot.send_document(chat_id, file_to_send).await?;
         }
         Err(e) => {
             if let Some(app_error) = e.downcast_ref::<AppError>() {
-                log::error!("Failed to generate EPUB: {:?}", app_error);
+                error!("Failed to generate EPUB: {:?}", app_error);
                 let user_message = match app_error {
                     AppError::AuthenticationFailed => {
                         "Authentication failed. Please check your credentials."
@@ -670,7 +692,7 @@ async fn trigger_epub_generation(
                 };
                 bot.send_message(chat_id, user_message).await?;
             } else {
-                log::error!("An unexpected error occurred: {:?}", e);
+                error!("An unexpected error occurred: {:?}", e);
                 bot.send_message(chat_id, "Sorry, an unexpected error occurred.")
                     .await?;
             }
@@ -679,4 +701,11 @@ async fn trigger_epub_generation(
 
     dialogue.exit().await?;
     Ok(())
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let invalid_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+    name.chars()
+        .map(|c| if invalid_chars.contains(&c) { '_' } else { c })
+        .collect()
 }
