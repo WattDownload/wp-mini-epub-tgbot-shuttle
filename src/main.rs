@@ -441,7 +441,7 @@ async fn callback_query_handler(
                     bot.edit_message_caption(msg.chat.id, msg.id)
                         .caption(format!(
                             "✅ Confirmed! Let's proceed for story: \n  -> {}",
-                            &title
+                            title
                         ))
                         .await?;
                 }
