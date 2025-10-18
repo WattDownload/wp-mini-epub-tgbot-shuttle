@@ -50,22 +50,18 @@ pub enum State {
     },
     ReceiveImageOption {
         story_id: u64,
-        title: String,
     },
     ReceiveLoginDecision {
         story_id: u64,
-        title: String,
         embed_images: bool,
     },
     ReceiveUsername {
         story_id: u64,
-        title: String,
         embed_images: bool,
         prompt_message_id: MessageId,
     },
     ReceivePassword {
         story_id: u64,
-        title: String,
         embed_images: bool,
         username: String,
         prompt_message_id: MessageId,
@@ -95,7 +91,6 @@ impl Service for WattpadBot {
             .branch(
                 dptree::case![State::ReceiveUsername {
                     story_id,
-                    title,
                     embed_images,
                     prompt_message_id
                 }]
@@ -104,7 +99,6 @@ impl Service for WattpadBot {
             .branch(
                 dptree::case![State::ReceivePassword {
                     story_id,
-                    title,
                     embed_images,
                     username,
                     prompt_message_id
@@ -186,7 +180,8 @@ async fn parse_story_id_from_input(input: &str, client: &WattpadClient) -> Resul
             {
                 Ok(part_info) => {
                     // Check if the API returned a valid ID string.
-                    if let Some(id_string) = part_info.group_id { // `id_string` is now a String
+                    if let Some(id_string) = part_info.group_id {
+                        // `id_string` is now a String
                         info!("Successfully found story ID string: {}", id_string);
 
                         // This can fail if the string is not a valid number.
@@ -456,7 +451,7 @@ async fn callback_query_handler(
                     .reply_markup(keyboard)
                     .await?;
                 dialogue
-                    .update(State::ReceiveImageOption { story_id, title })
+                    .update(State::ReceiveImageOption { story_id })
                     .await?;
             } else {
                 if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(msg)) = q.message {
@@ -472,7 +467,7 @@ async fn callback_query_handler(
                 dialogue.update(State::ReceiveStoryId).await?;
             }
         }
-        State::ReceiveImageOption { story_id, title } => {
+        State::ReceiveImageOption { story_id } => {
             if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(msg)) = q.message {
                 let confirmation_text = if data == "yes" {
                     "✅ We'll embed images for you."
@@ -494,14 +489,12 @@ async fn callback_query_handler(
             dialogue
                 .update(State::ReceiveLoginDecision {
                     story_id,
-                    title,
                     embed_images,
                 })
                 .await?;
         }
         State::ReceiveLoginDecision {
             story_id,
-            title,
             embed_images,
         } => {
             if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(msg)) = q.message {
@@ -522,7 +515,6 @@ async fn callback_query_handler(
                 dialogue
                     .update(State::ReceiveUsername {
                         story_id,
-                        title,
                         embed_images,
                         prompt_message_id: prompt_msg.id,
                     })
@@ -540,7 +532,6 @@ async fn callback_query_handler(
                     dialogue.chat_id(),
                     &dialogue,
                     story_id,
-                    &title,
                     embed_images,
                     Some(status_msg.id),
                     &http_client,
@@ -565,7 +556,7 @@ async fn receive_username(
     bot: Bot,
     dialogue: MyDialogue,
     msg: Message,
-    (story_id, title, embed_images, prompt_message_id): (u64, String, bool, MessageId),
+    (story_id, embed_images, prompt_message_id): (u64, bool, MessageId),
 ) -> HandlerResult {
     bot.delete_message(msg.chat.id, prompt_message_id)
         .await
@@ -582,7 +573,6 @@ async fn receive_username(
             dialogue
                 .update(State::ReceivePassword {
                     story_id,
-                    title,
                     embed_images,
                     username: username.to_string(),
                     prompt_message_id: new_prompt.id,
@@ -601,13 +591,7 @@ async fn receive_password(
     bot: Bot,
     dialogue: MyDialogue,
     msg: Message,
-    (story_id, title, embed_images, username, prompt_message_id): (
-        u64,
-        String,
-        bool,
-        String,
-        MessageId,
-    ),
+    (story_id, embed_images, username, prompt_message_id): (u64, bool, String, MessageId),
 ) -> HandlerResult {
     bot.delete_message(msg.chat.id, msg.id).await.ok();
     bot.delete_message(msg.chat.id, prompt_message_id)
@@ -651,7 +635,6 @@ async fn receive_password(
                 msg.chat.id,
                 &dialogue,
                 story_id,
-                &title,
                 embed_images,
                 Some(generating_msg.id),
                 &logged_in_client,
@@ -675,7 +658,6 @@ async fn receive_password(
             dialogue
                 .update(State::ReceiveUsername {
                     story_id,
-                    title,
                     embed_images,
                     prompt_message_id: prompt_msg.id,
                 })
@@ -707,7 +689,6 @@ async fn trigger_epub_generation(
     chat_id: ChatId,
     dialogue: &MyDialogue,
     story_id: u64,
-    title: &str,
     embed_images: bool,
     status_message_id: Option<MessageId>,
     http_client: &Client,
@@ -721,11 +702,12 @@ async fn trigger_epub_generation(
         story_id,
         embed_images,
         CONCURRENT_CHAPTER_REQUESTS,
+        None,
     )
     .await;
 
     match epub_result {
-        Ok(epub_bytes) => {
+        Ok(epub_result_struct) => {
             if let Some(id) = status_message_id {
                 bot.delete_message(chat_id, id).await.ok();
             }
@@ -736,10 +718,10 @@ async fn trigger_epub_generation(
             )
             .await?;
 
-            let sanitized_title = sanitize_filename(title);
-            let filename = format!("{}-{}.epub", sanitized_title, story_id);
+            let filename = format!("{}.epub", epub_result_struct.sanitized_title);
 
-            let file_to_send = teloxide::types::InputFile::memory(epub_bytes).file_name(filename);
+            let file_to_send = teloxide::types::InputFile::memory(epub_result_struct.epub_response)
+                .file_name(filename);
 
             bot.send_document(chat_id, file_to_send).await?;
         }
@@ -764,11 +746,4 @@ async fn trigger_epub_generation(
 
     dialogue.exit().await?;
     Ok(())
-}
-
-fn sanitize_filename(name: &str) -> String {
-    let invalid_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
-    name.chars()
-        .map(|c| if invalid_chars.contains(&c) { '_' } else { c })
-        .collect()
 }
