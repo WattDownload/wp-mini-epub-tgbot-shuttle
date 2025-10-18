@@ -13,4 +13,4 @@ shuttle-runtime = "0.57.0"
 teloxide = { version = "0.17.0", features = ["ctrlc_handler", "macros"] }
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }
 wp-mini = "0.1.2"
-wp-mini-epub = "0.7.2"
+wp-mini-epub = "0.7.4"
