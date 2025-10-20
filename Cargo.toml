@@ -8,9 +8,9 @@ anyhow = "1.0.100"
 log = "0.4.28"
 once_cell = "1.21.3"
 regex = "1.12.2"
-reqwest = { version = "0.12.24", features = ["cookies"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["cookies", "rustls-tls"] }
 shuttle-runtime = "0.57.0"
 teloxide = { version = "0.17.0", features = ["ctrlc_handler", "macros"] }
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }
-wp-mini = "0.1.2"
-wp-mini-epub = "0.8.1"
+wp-mini = "0.1.3"
+wp-mini-epub = "0.8.2"
