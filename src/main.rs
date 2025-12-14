@@ -73,7 +73,7 @@ type HandlerResult = Result<(), Box<dyn Error + Send + Sync>>;
 
 struct WattpadBot {
     bot: Bot,
-    http_client: Arc<Client>,
+    reqwest_client: Arc<Client>,
     wattpad_client: Arc<WattpadClient>,
 }
 
@@ -117,7 +117,7 @@ impl Service for WattpadBot {
         )
         .dependencies(dptree::deps![
             InMemStorage::<State>::new(),
-            self.http_client,
+            self.reqwest_client,
             self.wattpad_client
         ])
         .enable_ctrlc_handler()
@@ -129,7 +129,7 @@ impl Service for WattpadBot {
     }
 }
 
-fn http_client_builder() -> ClientBuilder {
+fn reqwest_client_builder() -> ClientBuilder {
     const APP_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36";
 
     Client::builder()
@@ -137,34 +137,27 @@ fn http_client_builder() -> ClientBuilder {
         .timeout(Duration::from_secs(300))
 }
 
-fn build_http_client() -> Client {
-    http_client_builder()
+fn build_reqwest_client() -> Client {
+    reqwest_client_builder()
         .build()
         .expect("Failed to create reqwest client")
 }
 
-fn create_logged_in_http_client() -> Client {
-    http_client_builder()
-        .cookie_store(true)
-        .build()
-        .expect("Failed to create temporary reqwest client")
-}
-
 async fn parse_story_id_from_input(input: &str, client: &WattpadClient) -> Result<u64, String> {
     // Try to match a full story URL
-    if let Some(captures) = STORY_URL_REGEX.captures(input) {
-        if let Some(id_match) = captures.get(1) {
+    if let Some(captures) = STORY_URL_REGEX.captures(input)
+        && let Some(id_match) = captures.get(1) {
             let story_id_str = id_match.as_str();
             info!("Matched story URL, found ID: {}", story_id_str);
             return story_id_str
                 .parse::<u64>()
                 .map_err(|_| "Invalid story ID found in URL.".to_string());
         }
-    }
+
 
     // If not a story URL, try to match a chapter/part URL
-    if let Some(captures) = PART_URL_REGEX.captures(input) {
-        if let Some(id_match) = captures.get(1) {
+    if let Some(captures) = PART_URL_REGEX.captures(input)
+        && let Some(id_match) = captures.get(1) {
             let part_id_str = id_match.as_str();
             info!("Matched part URL, found part ID: {}", part_id_str);
             let part_id = part_id_str
@@ -204,7 +197,7 @@ async fn parse_story_id_from_input(input: &str, client: &WattpadClient) -> Resul
                 }
             };
         }
-    }
+
 
     // If neither matched, assume it's a plain ID
     info!("No URL matched, attempting to parse as plain ID: {}", input);
@@ -223,12 +216,12 @@ async fn main(
 
     let bot = Bot::new(token);
 
-    let http_client = Arc::new(build_http_client());
+    let reqwest_client = Arc::new(build_reqwest_client());
     let wattpad_client = Arc::new(WattpadClient::new());
 
     Ok(WattpadBot {
         bot,
-        http_client,
+        reqwest_client,
         wattpad_client,
     })
 }
@@ -423,7 +416,8 @@ async fn callback_query_handler(
     bot: Bot,
     dialogue: MyDialogue,
     q: CallbackQuery,
-    http_client: Arc<Client>,
+    reqwest_client: Arc<Client>,
+    wattpad_client: Arc<WattpadClient>
 ) -> HandlerResult {
     bot.answer_callback_query(q.id).await?;
 
@@ -534,7 +528,8 @@ async fn callback_query_handler(
                     story_id,
                     embed_images,
                     Some(status_msg.id),
-                    &http_client,
+                    &wattpad_client,
+                    &reqwest_client,
                 )
                 .await?;
             }
@@ -591,6 +586,7 @@ async fn receive_password(
     bot: Bot,
     dialogue: MyDialogue,
     msg: Message,
+    reqwest_client: Arc<Client>,
     (story_id, embed_images, username, prompt_message_id): (u64, bool, String, MessageId),
 ) -> HandlerResult {
     bot.delete_message(msg.chat.id, msg.id).await.ok();
@@ -612,10 +608,10 @@ async fn receive_password(
         .send_message(msg.chat.id, "🔐 Verifying credentials...")
         .await?;
 
-    let logged_in_client = create_logged_in_http_client();
+    let auth_wattpad_client = WattpadClient::new();
 
     // Attempt to log in FIRST
-    match login(&logged_in_client, &username, &password).await {
+    match login(&auth_wattpad_client, &username, &password).await {
         Ok(_) => {
             info!("Logged in successfully. for username {}", username);
             // Login successful, now trigger the download
@@ -637,7 +633,8 @@ async fn receive_password(
                 story_id,
                 embed_images,
                 Some(generating_msg.id),
-                &logged_in_client,
+                &auth_wattpad_client,
+                &reqwest_client,
             )
             .await?;
         }
@@ -691,14 +688,16 @@ async fn trigger_epub_generation(
     story_id: u64,
     embed_images: bool,
     status_message_id: Option<MessageId>,
-    http_client: &Client,
+    wattpad_client: &WattpadClient,
+    reqwest_client: &Client,
 ) -> HandlerResult {
     const CONCURRENT_CHAPTER_REQUESTS: usize = 10;
 
     info!("Generating EPUB for story_id: {}", story_id);
 
     let epub_result = download_story_to_memory(
-        &http_client,
+        wattpad_client,
+        reqwest_client,
         story_id,
         embed_images,
         CONCURRENT_CHAPTER_REQUESTS,
