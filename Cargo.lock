@@ -3443,7 +3443,7 @@ dependencies = [
 
 [[package]]
 name = "wp-td"
-version = "0.7.0"
+version = "0.7.0-alpha.1"
 dependencies = [
  "anyhow",
  "log",
